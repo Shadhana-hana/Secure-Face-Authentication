@@ -1,6 +1,12 @@
+
 import librosa
 import numpy as np
 from pathlib import Path
+from typing import Optional, Tuple
+
+
+AudioData = np.ndarray
+PreprocessingResult = Tuple[AudioData, int, AudioData]
 
 
 # ==========================================
@@ -14,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 AUDIO_PATH = BASE_DIR / "data" / "audio" / "sample.wav"
 
 
-def load_audio(audio_path):
+def load_audio(audio_path: Path) -> Tuple[Optional[AudioData], Optional[int]]:
     """
     Load the audio file.
     """
@@ -51,7 +57,7 @@ Secure_Face_Authentication
 
         print("\nAudio loaded successfully!")
 
-        return audio, sample_rate
+        return audio, int(sample_rate)
 
     except Exception as e:
         print("\nError while loading audio:")
@@ -60,7 +66,7 @@ Secure_Face_Authentication
         return None, None
 
 
-def normalize_audio(audio):
+def normalize_audio(audio: Optional[AudioData]) -> Optional[AudioData]:
     """
     Normalize the audio values between -1 and 1.
     """
@@ -78,12 +84,15 @@ def normalize_audio(audio):
     return normalized_audio
 
 
-def extract_mfcc(audio, sample_rate):
+def extract_mfcc(
+    audio: Optional[AudioData],
+    sample_rate: Optional[int]
+) -> Optional[AudioData]:
     """
     Extract MFCC features from the audio.
     """
 
-    if audio is None:
+    if audio is None or sample_rate is None:
         return None
 
     mfcc = librosa.feature.mfcc(
@@ -95,7 +104,7 @@ def extract_mfcc(audio, sample_rate):
     return mfcc
 
 
-def preprocess_audio():
+def preprocess_audio() -> Optional[PreprocessingResult]:
     """
     Complete audio preprocessing pipeline.
     """
@@ -110,8 +119,8 @@ def preprocess_audio():
     # Step 1: Load audio
     audio, sample_rate = load_audio(AUDIO_PATH)
 
-    if audio is None:
-        return
+    if audio is None or sample_rate is None:
+        return None
 
     # Step 2: Display original information
     print("\nOriginal Audio Information")
@@ -123,6 +132,10 @@ def preprocess_audio():
     # Step 3: Normalize audio
     normalized_audio = normalize_audio(audio)
 
+    if normalized_audio is None:
+        print("Audio normalization failed.")
+        return None
+
     print("\nAudio normalized successfully.")
 
     # Step 4: Extract MFCC features
@@ -130,6 +143,10 @@ def preprocess_audio():
         normalized_audio,
         sample_rate
     )
+
+    if mfcc_features is None:
+        print("MFCC extraction failed.")
+        return None
 
     print("\nMFCC Features Extracted Successfully!")
     print("MFCC Shape:", mfcc_features.shape)
@@ -147,4 +164,9 @@ def preprocess_audio():
 
 if __name__ == "__main__":
 
-    processed_audio, sample_rate, mfcc_features = preprocess_audio()
+    result = preprocess_audio()
+
+    if result is None:
+        raise SystemExit("Audio preprocessing did not complete.")
+
+    processed_audio, sample_rate, mfcc_features = result

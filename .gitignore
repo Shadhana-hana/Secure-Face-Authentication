@@ -5,6 +5,7 @@ venv/
 # Environment variables
 .env
 .env.*
+*.key
 
 # Database
 *.db
@@ -17,9 +18,16 @@ db/
 
 # Private biometric data
 Data/faces/
+/output/
 
 # Private audio/data files
 Data/audio/
+data/audio/
+Data/audio_dtaset/
+
+# Local native quantum-library builds
+liboqs/
+oqs-build/
 
 # Generated feature files
 *.npy

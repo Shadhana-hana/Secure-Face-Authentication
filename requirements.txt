@@ -1,0 +1,10 @@
+torch
+torchvision
+facenet-pytorch
+Pillow
+numpy
+soundfile
+cryptography
+climage
+opencv-python<5
+mysql-connector-python

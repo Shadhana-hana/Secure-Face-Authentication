@@ -1,15 +1,24 @@
-import mysql.connector
+import getpass
 import os
 
+import mysql.connector
 
 class AudioDatabase:
 
     def __init__(self):
+        password = os.environ.get("MYSQL_PASSWORD")
+        if password is None:
+            password = getpass.getpass("MySQL password for root@localhost: ")
+
         self.connection = mysql.connector.connect(
-            host="localhost",
-            user="root",
-            password="naga*",
-            database="secure_face_authentication"
+            host=os.environ.get("MYSQL_HOST", "localhost"),
+            port=int(os.environ.get("MYSQL_PORT", "3306")),
+            user=os.environ.get("MYSQL_USER", "root"),
+            password=password,
+            database=os.environ.get(
+                "MYSQL_DATABASE",
+                "secure_face_authentication",
+            ),
         )
 
         print("Database connected successfully.")
