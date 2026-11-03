@@ -1,19 +1,20 @@
-"""Embed one encrypted face payload into multiple WAV carriers and measure recovery."""
+"""Embed one user's encrypted face-image payload into WAV carriers."""
 
 import argparse
 import csv
 import hashlib
 import io
+import math
 from pathlib import Path
 import struct
 
 import numpy as np
 import soundfile as sf
 from PIL import Image
+from modules.quality_evaluation import calculate_perceptual_metrics
 
 from main import (
     QUANT_STEP,
-    REPETITIONS,
     _bits_from_bytes,
     _embed_bit,
     decrypt_biometric_payload,
@@ -26,6 +27,8 @@ DEFAULT_PAYLOAD = ROOT / "output" / "encrypted_payload.bin"
 DEFAULT_AUDIO_ROOT = ROOT / "Data" / "audio_dtaset" / "VCC2020-database-master"
 OUTPUT_DIR = ROOT / "output" / "image_audio_batch"
 FRAME_HEADER_BYTES = 41
+# Short batch carriers need lower redundancy than the main pipeline's 8x frame.
+BATCH_REPETITIONS = 2
 MIN_PAYLOAD_ACCURACY = 65.0
 MIN_IMAGE_ACCURACY = 80.0
 
@@ -42,7 +45,7 @@ def frame_payload(payload):
 
 def embed_into_audio(audio, payload):
     frame = frame_payload(payload)
-    repeated_bits = np.repeat(_bits_from_bytes(frame), REPETITIONS)
+    repeated_bits = np.repeat(_bits_from_bytes(frame), BATCH_REPETITIONS)
     mono = audio if audio.ndim == 1 else audio[:, 0]
     required_samples = 2 * len(repeated_bits)
     if len(mono) < required_samples:
@@ -72,7 +75,7 @@ def embed_into_audio(audio, payload):
 
 def recover_frame_bits(stego, frame_bit_count):
     mono = stego if stego.ndim == 1 else stego[:, 0]
-    required_samples = frame_bit_count * REPETITIONS * 2
+    required_samples = frame_bit_count * BATCH_REPETITIONS * 2
     if len(mono) < required_samples:
         raise ValueError(
             f"Stego carrier is too short: need {required_samples} samples, "
@@ -82,11 +85,13 @@ def recover_frame_bits(stego, frame_bit_count):
     recovered_bits = []
     for bit_index in range(frame_bit_count):
         votes = []
-        for repetition in range(REPETITIONS):
-            pair_index = (bit_index * REPETITIONS + repetition) * 2
+        for repetition in range(BATCH_REPETITIONS):
+            pair_index = (
+                bit_index * BATCH_REPETITIONS + repetition
+            ) * 2
             difference = mono[pair_index] - mono[pair_index + 1]
             votes.append(int(np.floor(difference / QUANT_STEP)) % 2)
-        recovered_bits.append(int(sum(votes) > REPETITIONS // 2))
+        recovered_bits.append(int(sum(votes) > BATCH_REPETITIONS // 2))
     return np.asarray(recovered_bits, dtype=np.uint8)
 
 
@@ -135,6 +140,37 @@ def image_accuracy(source_image_bytes, recovered_image_bytes):
     }
 
 
+def audio_quality_metrics(original, stego, sample_rate):
+    """Measure waveform error and perceptual quality for one carrier pair."""
+    original = np.asarray(original, dtype=np.float64)
+    stego = np.asarray(stego, dtype=np.float64)
+    if original.shape != stego.shape:
+        raise ValueError(
+            f"Original and stego audio shapes differ: "
+            f"{original.shape} != {stego.shape}."
+        )
+
+    error = original - stego
+    mse = float(np.mean(error ** 2))
+    perceptual_metrics = calculate_perceptual_metrics(
+        original,
+        stego,
+        sample_rate,
+    )
+    return {
+        "audio_mse": mse,
+        "audio_rmse": float(np.sqrt(mse)),
+        "audio_mae": float(np.mean(np.abs(error))),
+        **perceptual_metrics,
+    }
+
+
+def format_metric(value, digits=6):
+    if value is None or not math.isfinite(value):
+        return "N/A"
+    return f"{value:.{digits}g}"
+
+
 def find_carriers(audio_root, required_samples, count):
     candidates = []
     for path in sorted(audio_root.rglob("*.wav")):
@@ -164,6 +200,7 @@ def evaluate_carrier(path, payload, source_image, key, output_dir, index):
     if saved_rate != sample_rate or saved_stego.shape != stego.shape:
         raise ValueError(f"WAV round-trip changed audio format for {path}.")
 
+    audio_metrics = audio_quality_metrics(audio, saved_stego, sample_rate)
     expected_bits = _bits_from_bytes(expected_frame)
     recovered_bits = recover_frame_bits(saved_stego, len(expected_bits))
     payload_start = FRAME_HEADER_BYTES * 8
@@ -193,6 +230,7 @@ def evaluate_carrier(path, payload, source_image, key, output_dir, index):
         "carrier": str(path.relative_to(ROOT)),
         "sample_rate_hz": sample_rate,
         "duration_seconds": len(audio) / sample_rate,
+        **audio_metrics,
         "payload_bytes": len(payload),
         "matching_bytes": matching_bytes,
         "byte_accuracy_percent": 100.0 * matching_bytes / len(payload),
@@ -212,7 +250,10 @@ def evaluate_carrier(path, payload, source_image, key, output_dir, index):
         return result
 
     try:
-        _, recovered_image = decrypt_biometric_payload(recovered_bytes, key)
+        _, recovered_image, _ = decrypt_biometric_payload(
+            recovered_bytes,
+            key,
+        )
         recovered_path = output_dir / f"{index:02d}_{path.stem}_recovered.jpg"
         recovered_path.write_bytes(recovered_image)
         image_metrics = image_accuracy(source_image, recovered_image)
@@ -241,7 +282,10 @@ def resolve_key(key_path, user_id):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Measure recovery of one encrypted face payload over 10 WAV files."
+        description=(
+            "Embed one user's encrypted face-image payload into 10 WAV files "
+            "and report recovery and audio-quality metrics."
+        )
     )
     parser.add_argument(
         "--payload",
@@ -297,7 +341,7 @@ def main():
         raise ValueError(f"Encrypted payload is empty: {args.payload}")
 
     required_samples = (
-        (FRAME_HEADER_BYTES + len(payload)) * 8 * REPETITIONS * 2
+        (FRAME_HEADER_BYTES + len(payload)) * 8 * BATCH_REPETITIONS * 2
     )
     carriers = find_carriers(args.audio_root, required_samples, args.count)
     key, resolved_key_path = resolve_key(args.key, args.user_id)
@@ -317,6 +361,11 @@ def main():
         results.append(result)
         print(
             f"{index:02d}. {Path(result['carrier']).name}: "
+            f"MSE {format_metric(result['audio_mse'], 10)}, "
+            f"RMSE {format_metric(result['audio_rmse'], 10)}, "
+            f"MAE {format_metric(result['audio_mae'], 10)}, "
+            f"PESQ {format_metric(result['pesq'])}, "
+            f"STOI {format_metric(result['stoi'])}, "
             f"image {result['normalized_image_accuracy_percent']:.2f}%, "
             f"recovery {'PASS' if result['image_recovery_pass'] else 'FAIL'}, "
             f"SHA-256 {'PASS' if result['checksum_pass'] else 'FAIL'}"
@@ -343,6 +392,33 @@ def main():
     print(f"\nAudio files tested: {len(results)}")
     print(f"One source image: {args.source_image}")
     print(f"AES key: {resolved_key_path}")
+    print("\nMEAN AUDIO QUALITY METRICS")
+    for metric_name, digits in (
+        ("audio_mse", 10),
+        ("audio_rmse", 10),
+        ("audio_mae", 10),
+        ("pesq", 6),
+        ("stoi", 6),
+    ):
+        available_values = [
+            row[metric_name]
+            for row in results
+            if row[metric_name] is not None
+            and math.isfinite(row[metric_name])
+        ]
+        mean_value = (
+            float(np.mean(available_values))
+            if available_values
+            else None
+        )
+        print(
+            f"{metric_name.upper():<10}: "
+            f"{format_metric(mean_value, digits)}"
+        )
+    if not any(row["pesq"] is not None for row in results):
+        print("PESQ unavailable: install the optional 'pesq' package.")
+    if not any(row["stoi"] is not None for row in results):
+        print("STOI unavailable: install the 'pystoi' package.")
     print(f"Aggregate image recovery accuracy: {image_accuracy:.2f}%")
     print(f"Image recoveries: {image_recovery_passes}/{len(results)} passed")
     print(

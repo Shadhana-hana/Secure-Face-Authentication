@@ -29,6 +29,7 @@ import argparse
 import textwrap
 import shutil
 import io
+import subprocess
 
 try:
     import winsound
@@ -511,8 +512,8 @@ def make_cancelable_template(
     transform = CancelableBiometrics(dimension=embedding.size)
     template = transform.transform(embedding, user_id)
 
-    print("\n  Cancelable template after transform (first 16 values):")
-    print(" ", np.array2string(template[:16], precision=5))
+    print("\n  Full cancelable biometric result:")
+    print(" ", np.array2string(template, precision=5, threshold=np.inf))
     info("User key identifier", user_id)
     info("Template shape", str(template.shape))
     info("Raw template L2 norm", f"{np.linalg.norm(embedding):.6f}")
@@ -1406,6 +1407,14 @@ def main():
         default=None,
         help="Optional receiver-side face image; if omitted, the webcam captures a second face."
     )
+    parser.add_argument(
+        "--authenticate",
+        action="store_true",
+        help=(
+            "Run the receiver face-authentication flow instead of the default "
+            "10-audio quality evaluation."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Enable ANSI colours on Windows ───────────────────────────────────────
@@ -1453,11 +1462,36 @@ def main():
     sender_face_crop = OUTPUT_DIR / "sender_face_cropped_160x160.jpg"
     face_image_bytes, compressed_size = compress_face_image(sender_face_crop)
     info("Image embedded in audio", f"{compressed_size[0]}x{compressed_size[0]} grayscale JPEG")
+    with Image.open(io.BytesIO(face_image_bytes)) as embedded_image:
+        embedded_image.load()
+        show_image(
+            embedded_image.copy(),
+            label="GRAYSCALE JPEG IMAGE EMBEDDED IN AUDIO",
+        )
     key, _, encrypted_pkg, _, _ = encrypt_features(
         cancelable_template,
         user_id,
         face_image_bytes,
     )
+    if not args.authenticate:
+        step(6, "Embedding Image into 10 Audio Files and Measuring Quality")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modules.image_audio_batch_evaluation",
+                "--source-image",
+                str(sender_face_crop),
+                "--user-id",
+                user_id,
+                "--count",
+                "10",
+            ],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        return
+
     user_key_path = key_path_for_user(user_id)
     display_encrypted_features(encrypted_pkg)                            # Step 5
     carrier_path = find_carrier_audio(user_id, len(encrypted_pkg))       # Step 6
