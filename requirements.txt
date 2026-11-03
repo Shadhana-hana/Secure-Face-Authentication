@@ -5,6 +5,8 @@ Pillow
 numpy
 soundfile
 cryptography
-climage
+librosa
 opencv-python<5
 mysql-connector-python
+pystoi
+# Optional: install pesq when a compatible native C++ build toolchain is available.

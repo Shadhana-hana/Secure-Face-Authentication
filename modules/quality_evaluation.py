@@ -1,150 +1,277 @@
 
 from pathlib import Path
+from importlib import import_module
 import math
+from typing import Any
+
+import librosa
 import numpy as np
 import soundfile as sf
-import librosa
+
+try:
+    stoi: Any = import_module("pystoi.stoi").stoi
+except ImportError:  # STOI is unavailable until the optional package is installed.
+    stoi = None
+
+try:
+    pesq: Any = import_module("pesq").pesq
+except ImportError:  # PESQ uses a native extension that may not build on Windows.
+    pesq = None
+
 
 ROOT = Path(__file__).resolve().parent.parent
-AUDIO_DIR = ROOT / "data" / "audio"
-STEGO_PATH = AUDIO_DIR / "stego_audio.wav"
-CARRIER_LIST = AUDIO_DIR / "selected_carrier_audio.txt"
-PAYLOAD_PATH = AUDIO_DIR / "encoded_biometric_payload.bin"
+OUTPUT_DIR = ROOT / "output"
+ORIGINAL_PATH = OUTPUT_DIR / "carrier_audio_before_embedding.wav"
+STEGO_PATH = OUTPUT_DIR / "stego_audio.wav"
+PAYLOAD_PATH = OUTPUT_DIR / "encrypted_payload.bin"
 
 REPETITIONS = 8
-QUANT_STEP = 0.002
+HEADER_BYTES = 41
 
-def read_carrier_path():
-    if not CARRIER_LIST.exists():
-        raise FileNotFoundError(f"Missing: {CARRIER_LIST}")
-    path = Path(CARRIER_LIST.read_text(encoding="utf-8").strip())
-    if not path.is_absolute():
-        path = ROOT / path
-    if not path.exists():
-        raise FileNotFoundError(f"Carrier not found: {path}")
-    return path
 
-def mse(a, b):
-    n = min(len(a), len(b))
-    return float(np.mean((a[:n] - b[:n]) ** 2))
+def format_value(value, digits=8):
+    if value is None:
+        return "N/A"
+    if isinstance(value, (float, np.floating)):
+        if math.isnan(float(value)):
+            return "N/A"
+        if math.isinf(float(value)):
+            return "Infinity" if value > 0 else "-Infinity"
+        return f"{value:.{digits}f}"
+    return str(value)
 
-def cosine_similarity(a, b):
-    a = np.asarray(a).ravel().astype(np.float64)
-    b = np.asarray(b).ravel().astype(np.float64)
-    n = min(a.size, b.size)
-    a, b = a[:n], b[:n]
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
-    return float(np.dot(a, b) / denom) if denom else float("nan")
 
-def compare_vectors(name, original, recovered):
-    # Align frame counts before comparing.
-    frames = min(original.shape[1], recovered.shape[1])
-    a = original[:, :frames]
-    b = recovered[:, :frames]
+def print_table(title, headers, rows):
+    values = [[str(value) for value in row] for row in rows]
+    widths = [
+        max(len(str(header)), *(len(row[index]) for row in values))
+        for index, header in enumerate(headers)
+    ]
+    border = "+-" + "-+-".join("-" * width for width in widths) + "-+"
 
-    print(f"\n{name}")
-    print(f"  Shape compared : {a.shape}")
-    print(f"  MSE            : {mse(a, b):.10f}")
-    print(f"  RMSE           : {math.sqrt(mse(a, b)):.10f}")
-    print(f"  MAE            : {float(np.mean(np.abs(a-b))):.10f}")
-    print(f"  Cosine similarity (flattened): "
-          f"{cosine_similarity(a, b):.8f}")
+    print(f"\n{title}")
+    print(border)
+    print("| " + " | ".join(
+        str(header).ljust(widths[index])
+        for index, header in enumerate(headers)
+    ) + " |")
+    print(border)
+    for row in values:
+        print("| " + " | ".join(
+            row[index].ljust(widths[index])
+            for index in range(len(headers))
+        ) + " |")
+    print(border)
 
-def main():
-    carrier_path = read_carrier_path()
-    if not STEGO_PATH.exists():
-        raise FileNotFoundError(f"Missing: {STEGO_PATH}")
 
-    original, sr1 = sf.read(carrier_path, dtype="float32")
-    stego, sr2 = sf.read(STEGO_PATH, dtype="float32")
+def calculate_vector_metrics(reference, comparison):
+    reference = np.asarray(reference, dtype=np.float64).ravel()
+    comparison = np.asarray(comparison, dtype=np.float64).ravel()
+    if reference.shape != comparison.shape:
+        raise ValueError(
+            f"Compared arrays must have the same shape: "
+            f"{reference.shape} != {comparison.shape}"
+        )
 
-    if original.ndim > 1:
-        original = original.mean(axis=1)
-    if stego.ndim > 1:
-        stego = stego.mean(axis=1)
-    if sr1 != sr2:
-        raise ValueError("Carrier and stego sample rates differ.")
+    error = reference - comparison
+    mse = float(np.mean(error ** 2))
+    denominator = float(np.linalg.norm(reference) * np.linalg.norm(comparison))
+    correlation = (
+        float(np.corrcoef(reference, comparison)[0, 1])
+        if np.std(reference) > 0 and np.std(comparison) > 0
+        else float("nan")
+    )
 
-    n = min(len(original), len(stego))
-    original, stego = original[:n], stego[:n]
-    error = original - stego
-    signal_power = np.mean(original ** 2)
-    noise_power = np.mean(error ** 2)
+    return {
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "mae": float(np.mean(np.abs(error))),
+        "correlation": correlation,
+        "cosine_similarity": (
+            float(np.dot(reference, comparison) / denominator)
+            if denominator > 0 else float("nan")
+        ),
+    }
 
-    snr = (10 * np.log10(signal_power / noise_power)
-           if noise_power > 0 else float("inf"))
 
-    print("=" * 62)
-    print("AUDIO, CONTENT/STYLE AND CAPACITY EVALUATION")
-    print("=" * 62)
-    print(f"Carrier          : {carrier_path}")
-    print(f"Stego            : {STEGO_PATH}")
-    print(f"Sample rate      : {sr1} Hz")
-    print(f"Duration         : {n / sr1:.4f} seconds")
-    print(f"Raw SNR          : {snr:.4f} dB")
-    print(f"MSE              : {np.mean(error ** 2):.10f}")
-    print(f"RMSE             : {np.sqrt(np.mean(error ** 2)):.10f}")
-    print(f"MAE              : {np.mean(np.abs(error)):.10f}")
+def calculate_perceptual_metrics(reference, comparison, sample_rate):
+    reference = np.asarray(reference, dtype=np.float32)
+    comparison = np.asarray(comparison, dtype=np.float32)
+    if reference.ndim == 2:
+        reference = np.asarray(reference.mean(axis=1), dtype=np.float32)
+    if comparison.ndim == 2:
+        comparison = np.asarray(comparison.mean(axis=1), dtype=np.float32)
+    if reference.ndim != 1 or comparison.ndim != 1:
+        raise ValueError(
+            "PESQ and STOI require mono audio or frames-by-channels arrays."
+        )
+    if reference.shape != comparison.shape:
+        raise ValueError(
+            "PESQ and STOI require equal-length signals: "
+            f"{reference.shape} != {comparison.shape}"
+        )
+    if reference.size == 0 or sample_rate <= 0:
+        raise ValueError("Audio and sample rate must be non-empty and positive.")
+    if not np.isfinite(reference).all() or not np.isfinite(comparison).all():
+        raise ValueError("Audio contains non-finite values.")
 
-    # Consistent MFCC-based proxy features for both signals.
-    # This split is a diagnostic proxy, not proof of learned
-    # semantic content/style disentanglement.
+    perceptual_score = None
+    if pesq is not None:
+        pesq_sample_rate = 8000 if sample_rate <= 8000 else 16000
+        pesq_reference = librosa.resample(
+            reference,
+            orig_sr=sample_rate,
+            target_sr=pesq_sample_rate,
+        )
+        pesq_comparison = librosa.resample(
+            comparison,
+            orig_sr=sample_rate,
+            target_sr=pesq_sample_rate,
+        )
+        perceptual_score = float(
+            pesq(
+                pesq_sample_rate,
+                pesq_reference,
+                pesq_comparison,
+                "nb" if pesq_sample_rate == 8000 else "wb",
+            )
+        )
+    intelligibility_score = (
+        float(stoi(reference, comparison, sample_rate, extended=False))
+        if stoi is not None
+        else None
+    )
+    return {
+        "pesq": perceptual_score,
+        "stoi": intelligibility_score,
+    }
+
+
+def calculate_feature_rows(original, stego, sample_rate):
+    original_mono = np.mean(original, axis=1)
+    stego_mono = np.mean(stego, axis=1)
+
     def get_features(audio):
         return librosa.feature.mfcc(
             y=audio,
-            sr=sr1,
+            sr=sample_rate,
             n_mfcc=13,
             n_fft=1024,
-            hop_length=256
+            hop_length=256,
         )
 
-    orig_mfcc = get_features(original)
-    stego_mfcc = get_features(stego)
+    original_features = get_features(original_mono)
+    stego_features = get_features(stego_mono)
+    feature_sets = (
+        ("All MFCC coefficients", original_features, stego_features),
+        ("Content proxy (MFCC 0-7)", original_features[:8], stego_features[:8]),
+        ("Style proxy (MFCC 8-12)", original_features[8:], stego_features[8:]),
+    )
 
-    compare_vectors("MFCC feature comparison", orig_mfcc, stego_mfcc)
-    compare_vectors("Content proxy (MFCC rows 0-7)",
-                    orig_mfcc[:8], stego_mfcc[:8])
-    compare_vectors("Style proxy (MFCC rows 8-12)",
-                    orig_mfcc[8:], stego_mfcc[8:])
+    rows = []
+    for name, reference, comparison in feature_sets:
+        metrics = calculate_vector_metrics(reference, comparison)
+        rows.append([
+            name,
+            f"{reference.shape[0]} x {reference.shape[1]}",
+            format_value(metrics["mse"], 10),
+            format_value(metrics["rmse"], 10),
+            format_value(metrics["mae"], 10),
+            format_value(metrics["cosine_similarity"], 8),
+        ])
+    return rows
 
-    # PESQ: standard wideband PESQ operates at 16 kHz.
-    try:
-        from pesq import pesq
-        ref16 = librosa.resample(
-            original, orig_sr=sr1, target_sr=16000
+
+def main():
+    for audio_path in (ORIGINAL_PATH, STEGO_PATH):
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Required audio file not found: {audio_path}")
+
+    original, original_sr = sf.read(
+        ORIGINAL_PATH, dtype="float64", always_2d=True
+    )
+    stego, stego_sr = sf.read(
+        STEGO_PATH, dtype="float64", always_2d=True
+    )
+
+    if original_sr != stego_sr:
+        raise ValueError(
+            f"Sample rates differ: original={original_sr}, stego={stego_sr}"
         )
-        deg16 = librosa.resample(
-            stego, orig_sr=sr1, target_sr=16000
+    if original.shape != stego.shape:
+        raise ValueError(
+            f"Audio shapes differ: original={original.shape}, "
+            f"stego={stego.shape}. Metrics require identical lengths/channels."
         )
-        n16 = min(len(ref16), len(deg16))
-        score = pesq(16000, ref16[:n16], deg16[:n16], "wb")
-        print(f"\nPESQ wideband    : {score:.4f}")
-    except Exception as exc:
-        print("\nPESQ unavailable or failed:", exc)
-        print("Check the pesq installation and input signal validity.")
 
-    # Capacity estimate for this implementation:
-    # one bit per sample pair, with each bit repeated 8 times.
-    pair_count = n // 2
+    metrics = calculate_vector_metrics(original, stego)
+    perceptual_metrics = calculate_perceptual_metrics(
+        original,
+        stego,
+        original_sr,
+    )
+    signal_power = float(np.mean(original ** 2))
+    noise_power = metrics["mse"]
+    snr_db = (
+        float("inf") if noise_power == 0
+        else 10.0 * math.log10(signal_power / noise_power)
+        if signal_power > 0 else float("-inf")
+    )
+    sample_count = original.shape[0]
+    duration = sample_count / original_sr
+
+    print("=" * 78)
+    print("AUDIO QUALITY EVALUATION")
+    print("=" * 78)
+    print_table(
+        "Waveform quality metrics",
+        ("Metric", "Measured value"),
+        (
+            ("Original carrier", str(ORIGINAL_PATH)),
+            ("Stego audio", str(STEGO_PATH)),
+            ("Sample rate (Hz)", original_sr),
+            ("Channels", original.shape[1]),
+            ("Samples per channel", sample_count),
+            ("Duration (seconds)", format_value(duration, 6)),
+            ("SNR (dB)", format_value(snr_db, 8)),
+            ("MSE", format_value(metrics["mse"], 12)),
+            ("RMSE", format_value(metrics["rmse"], 12)),
+            ("MAE", format_value(metrics["mae"], 12)),
+            ("Pearson correlation", format_value(metrics["correlation"], 10)),
+            ("Cosine similarity", format_value(metrics["cosine_similarity"], 10)),
+            ("PESQ", format_value(perceptual_metrics["pesq"], 6)),
+            ("STOI", format_value(perceptual_metrics["stoi"], 6)),
+        ),
+    )
+
+    print_table(
+        "MFCC feature comparison (diagnostic proxies, not HIFI latent vectors)",
+        ("Feature set", "Shape", "MSE", "RMSE", "MAE", "Cosine similarity"),
+        calculate_feature_rows(original, stego, original_sr),
+    )
+
+    pair_count = sample_count // 2
     capacity_bits = pair_count // REPETITIONS
     capacity_bytes = capacity_bits // 8
-    frame_bytes = 41 + (
-        PAYLOAD_PATH.stat().st_size if PAYLOAD_PATH.exists() else 0
-    )
+    payload_bytes = PAYLOAD_PATH.stat().st_size if PAYLOAD_PATH.exists() else 0
+    frame_bytes = HEADER_BYTES + payload_bytes
     frame_bits = frame_bytes * 8
-    duration = n / sr1
+    utilization = (
+        100.0 * frame_bytes / capacity_bytes if capacity_bytes else float("nan")
+    )
+    print_table(
+        "Embedding capacity (theoretical for this sample-pair implementation)",
+        ("Metric", "Value"),
+        (
+            ("Available sample pairs", f"{pair_count:,}"),
+            ("Estimated capacity (bytes)", f"{capacity_bytes:,}"),
+            ("Encrypted payload (bytes)", f"{payload_bytes:,}"),
+            ("Frame including header (bytes)", f"{frame_bytes:,}"),
+            ("Frame bitrate (bps)", format_value(frame_bits / duration, 4)),
+            ("Capacity utilization (%)", format_value(utilization, 4)),
+        ),
+    )
 
-    print("\nSTEGANOGRAPHIC CAPACITY")
-    print(f"Available sample pairs       : {pair_count}")
-    print(f"Estimated capacity           : {capacity_bytes} bytes")
-    print(f"Embedded frame size estimate : {frame_bytes} bytes")
-    print(f"Frame bits per second        : {frame_bits / duration:.2f} bps")
-    print(f"Capacity utilization         : "
-          f"{100 * frame_bytes / capacity_bytes:.2f}%"
-          if capacity_bytes else "Capacity utilization unavailable")
-
-    print("\nNote: capacity is a theoretical estimate based on the")
-    print("current sample-pair and repetition settings.")
 
 if __name__ == "__main__":
     main()

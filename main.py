@@ -17,7 +17,7 @@
 
   Requirements:
       pip install facenet-pytorch torch Pillow numpy soundfile
-                  cryptography pillow-avif-plugin climage
+                  cryptography pillow-avif-plugin
 =============================================================================
 """
 
@@ -41,13 +41,6 @@ import soundfile as sf
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-# ─── Optional: rich-terminal image display ───────────────────────────────────
-try:
-    import climage                  # renders images as ANSI art in terminal
-    _HAS_CLIMAGE = True
-except ImportError:
-    _HAS_CLIMAGE = False
-
 # ─── Deep-learning models ─────────────────────────────────────────────────────
 import torch
 from facenet_pytorch import MTCNN, InceptionResnetV1
@@ -56,6 +49,7 @@ from facenet_pytorch import MTCNN, InceptionResnetV1
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from modules.cancelable_biometrics import CancelableBiometrics
 from modules.pipeline_storage import PipelineStorage
+from modules.quality_evaluation import calculate_perceptual_metrics
 
 # =============================================================================
 # GLOBAL PATHS
@@ -70,6 +64,10 @@ CARRIER_COPY_OUTPUT = OUTPUT_DIR / "carrier_audio_before_embedding.wav"
 KEY_OUTPUT     = OUTPUT_DIR / "aes_key.bin"
 KEYS_DIR       = OUTPUT_DIR / "user_keys"
 PAYLOAD_OUTPUT = OUTPUT_DIR / "encrypted_payload.bin"
+AUTHENTICATION_THRESHOLD = 0.90
+MAX_AUTH_CAPTURE_ATTEMPTS = 3
+MIN_CAPTURE_FACE_SIZE = 100
+MIN_CAPTURE_SHARPNESS = 30.0
 
 # Fallback audio path – first WAV found in Data/
 AUDIO_SEARCH_ROOT = BASE_DIR / "Data"
@@ -121,48 +119,39 @@ def err(msg):
 # IMAGE DISPLAY IN CONSOLE
 # =============================================================================
 
-def show_image_in_console(image_path: Path, label: str = "", width: int = 80):
-    """
-    Render the image directly inside the terminal window.
-
-    Strategy:
-      1. If `climage` is installed → full ANSI-colour block art.
-      2. Fallback → ASCII-art using grayscale brightness chars.
-    """
-    print(f"\n{MAGENTA}{BOLD}  ┌── {label} {'─' * (60 - len(label))}┐{RESET}")
-
-    if not image_path.exists():
-        warn(f"Image file not found: {image_path}")
-        return
+def show_image(image_source: Path | Image.Image, label: str = ""):
+    """Render a color image preview in the terminal using ANSI truecolor blocks."""
+    image_name = image_source.name if isinstance(image_source, Path) else "recovered image"
+    print(f"\n{MAGENTA}{BOLD}  {label or image_name}{RESET}")
 
     try:
-        if _HAS_CLIMAGE:
-            # climage renders coloured ANSI block characters
-            output = climage.convert(str(image_path), width=width, is_unicode=True)
-            # Indent every line
-            for line in output.splitlines():
-                print("  " + line)
+        if isinstance(image_source, Path):
+            if not image_source.exists():
+                warn(f"Image file not found: {image_source}")
+                return
+            image = Image.open(image_source)
         else:
-            # ── Fallback pure-PIL ASCII art ──────────────────────────────────
-            _ascii_image(image_path, width=width)
+            image = image_source
+        image = image.convert("RGB")
+        width = 60
+        height = max(2, round(image.height / image.width * width))
+        if height % 2:
+            height += 1
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        pixels = np.asarray(image)
+
+        for row in range(0, height, 2):
+            line = []
+            for column in range(width):
+                top = pixels[row, column]
+                bottom = pixels[row + 1, column]
+                line.append(
+                    f"\033[38;2;{top[0]};{top[1]};{top[2]}m"
+                    f"\033[48;2;{bottom[0]};{bottom[1]};{bottom[2]}m▀"
+                )
+            print("  " + "".join(line) + RESET)
     except Exception as e:
-        warn(f"Could not render image: {e}")
-
-    print(f"{MAGENTA}{BOLD}  └{'─' * (62)}┘{RESET}")
-
-
-def _ascii_image(image_path: Path, width: int = 80):
-    """Pure-Python ASCII art renderer (no external libs)."""
-    CHARS = "@#S%?*+;:,. "   # dense → light
-    img   = Image.open(image_path).convert("L")   # grayscale
-    # Keep aspect ratio (terminal chars are ~2× taller than wide)
-    aspect  = img.height / img.width
-    height  = int(aspect * width * 0.45)
-    img     = img.resize((width, height), Image.Resampling.LANCZOS)
-    pixels  = np.array(img)
-    for row in pixels:
-        line = "".join(CHARS[int(v / 255 * (len(CHARS) - 1))] for v in row)
-        print("  " + line)
+        warn(f"Could not render image in the console: {e}")
 
 
 def display_face_annotated(image_path: Path, boxes, output_path: Path):
@@ -249,7 +238,7 @@ def load_face_image(image_path: Path) -> Image.Image:
     ok("Image loaded successfully.")
 
     # ── Display the original image ────────────────────────────────────────────
-    show_image_in_console(image_path, label="INPUT FACE IMAGE")
+    show_image(image_path, label="INPUT FACE IMAGE")
 
     return img
 
@@ -276,6 +265,19 @@ def capture_face_from_camera(
             f"Could not open camera {camera_index}. Check that a webcam is "
             "connected and not in use by another application."
         )
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    camera.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+    info(
+        "Camera resolution",
+        f"{int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))} × "
+        f"{int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))} px",
+    )
+    info(
+        "Capture quality gate",
+        f"face at least {MIN_CAPTURE_FACE_SIZE}px; sharpness at least "
+        f"{MIN_CAPTURE_SHARPNESS:.0f}",
+    )
 
     capture_path = capture_path or OUTPUT_DIR / "captured_face.jpg"
     captured = False
@@ -306,6 +308,9 @@ def capture_face_from_camera(
             )
             preview = cv2.flip(frame, 1)
             current_face_crop = None
+            quality_message = ""
+            status = "No face detected - move into view"
+            button_color = (50, 50, 170)
             if len(faces):
                 x, y, width, height = max(faces, key=lambda box: box[2] * box[3])
                 padding_x = int(width * 0.15)
@@ -314,7 +319,17 @@ def capture_face_from_camera(
                 top = max(0, y - padding_y)
                 right = min(frame.shape[1], x + width + padding_x)
                 bottom = min(frame.shape[0], y + height + padding_y)
-                current_face_crop = frame[top:bottom, left:right]
+                face_gray = gray[y:y + height, x:x + width]
+                sharpness = float(
+                    cv2.Laplacian(face_gray, cv2.CV_64F).var()
+                )
+                if min(width, height) < MIN_CAPTURE_FACE_SIZE:
+                    quality_message = "Move closer to the camera"
+                elif sharpness < MIN_CAPTURE_SHARPNESS:
+                    quality_message = "Blurry - improve focus and lighting"
+                else:
+                    current_face_crop = frame[top:bottom, left:right]
+                    status = "Face quality good - ready"
 
                 mirrored_x = frame.shape[1] - x - width
                 cv2.rectangle(
@@ -324,11 +339,11 @@ def capture_face_from_camera(
                     (40, 220, 40),
                     2,
                 )
-                button_color = (30, 130, 30)
-                status = "Face detected - ready"
-            else:
-                button_color = (50, 50, 170)
-                status = "No face detected - move into view"
+                button_color = (
+                    (30, 130, 30)
+                    if current_face_crop is not None
+                    else (50, 50, 170)
+                )
 
             cv2.rectangle(preview, (20, 48), (280, 96), button_color, -1)
             cv2.putText(
@@ -351,6 +366,17 @@ def capture_face_from_camera(
                 2,
                 cv2.LINE_AA,
             )
+            if quality_message:
+                cv2.putText(
+                    preview,
+                    quality_message,
+                    (20, 185),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (40, 180, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
             cv2.putText(
                 preview,
                 "Q: quit",
@@ -367,7 +393,10 @@ def capture_face_from_camera(
             if capture_requested or key in (ord("c"), ord("C"), ord(" "), 13):
                 capture_requested = False
                 if current_face_crop is None:
-                    print("No face is detected yet. Center your face in the camera and try again.")
+                    print(
+                        "Capture not ready. Move closer, face the camera, "
+                        "and improve lighting/focus."
+                    )
                     continue
                 if not cv2.imwrite(str(capture_path), current_face_crop):
                     raise RuntimeError("Could not save the detected face crop.")
@@ -412,7 +441,7 @@ def extract_features(image_path: Path, device, artifact_prefix: str = "sender"):
     # Save annotated image and display it
     annotated_path = OUTPUT_DIR / f"{artifact_prefix}_face_detected.jpg"
     display_face_annotated(image_path, boxes[0], annotated_path)
-    show_image_in_console(annotated_path, label="DETECTED FACE  (bounding box)")
+    show_image(annotated_path, label="DETECTED FACE  (bounding box)")
 
     # ── Crop & embed ──────────────────────────────────────────────────────────
     face_tensor = mtcnn(img)
@@ -427,17 +456,21 @@ def extract_features(image_path: Path, device, artifact_prefix: str = "sender"):
     cropped_pil  = Image.fromarray(cropped_np, "RGB")
     cropped_path = OUTPUT_DIR / f"{artifact_prefix}_face_cropped_160x160.jpg"
     cropped_pil.save(cropped_path)
-    show_image_in_console(cropped_path, label="CROPPED FACE  (160 × 160 px — fed to model)")
+    show_image(cropped_path, label="CROPPED FACE  (160 × 160 px — fed to model)")
 
-    face_tensor = face_tensor.unsqueeze(0).to(device)
+    face_batch = torch.stack(
+        (face_tensor, torch.flip(face_tensor, dims=(2,))),
+    ).to(device)
     with torch.no_grad():
-        embedding = model(face_tensor)
+        embeddings = model(face_batch)
 
-    embedding = embedding.cpu().numpy()[0]
+    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+    embedding = embeddings.mean(dim=0).cpu().numpy()
     norm      = np.linalg.norm(embedding)
     if norm > 0:
         embedding = embedding / norm
 
+    info("Embedding views", "original + horizontal flip")
     info("Embedding shape",    str(embedding.shape))
     info("Embedding dtype",    str(embedding.dtype))
     info("Embedding L2-norm",  f"{np.linalg.norm(embedding):.6f}")
@@ -488,6 +521,14 @@ def make_cancelable_template(
     return template
 
 
+def cosine_similarity(first: np.ndarray, second: np.ndarray) -> float:
+    first_norm = np.linalg.norm(first)
+    second_norm = np.linalg.norm(second)
+    if first_norm == 0 or second_norm == 0:
+        return 0.0
+    return float(np.dot(first, second) / (first_norm * second_norm))
+
+
 # =============================================================================
 # STEP 4 — AES-256-GCM ENCRYPTION
 # =============================================================================
@@ -518,7 +559,7 @@ def encrypt_features(embedding: np.ndarray, user_id: str, face_image: bytes):
     info("Quantisation scale",       f"{float(scale):.8f}")
 
     # ── Build compact plaintext with header ──────────────────────────────────
-    MAGIC   = b"CBQ2"
+    MAGIC   = b"CBQ3"
     VERSION = 1
     header  = (MAGIC
                 + struct.pack(">B", VERSION)
@@ -669,7 +710,7 @@ def play_audio_file(audio_path: Path, stage_label: str) -> None:
 # =============================================================================
 
 REPETITIONS = 8        # each bit repeated 8× for robustness
-QUANT_STEP  = 0.002    # QIM step size
+QUANT_STEP  = 0.001    # Smaller QIM step reduces distortion while remaining PCM-robust.
 
 
 def _bits_from_bytes(data: bytes) -> np.ndarray:
@@ -739,8 +780,10 @@ def embed_payload(
         warn(f"Peak {peak:.4f} > 1.0 — normalising to prevent clipping.")
         stego = stego / peak
 
-    sf.write(str(STEGO_OUTPUT), stego, sample_rate, subtype="PCM_16")
+    output_subtype = sf.info(str(CARRIER_COPY_OUTPUT)).subtype
+    sf.write(str(STEGO_OUTPUT), stego, sample_rate, subtype=output_subtype)
     info("Output file", str(STEGO_OUTPUT))
+    info("WAV subtype", output_subtype)
     ok("Steganographic embedding complete.")
 
     stego_mono = stego if stego.ndim == 1 else stego[:, 0]
@@ -752,36 +795,73 @@ def embed_payload(
 # =============================================================================
 
 def display_waveform_after(
-    carrier_mono: np.ndarray,
-    stego_mono:   np.ndarray,
+    carrier_audio: np.ndarray,
+    stego_audio:   np.ndarray,
     sample_rate:  int
 ):
     step(9, "Stego Audio Waveform  [AFTER EMBEDDING]")
 
+    carrier_audio = np.asarray(carrier_audio, dtype=np.float64)
+    stego_audio = np.asarray(stego_audio, dtype=np.float64)
+    if carrier_audio.ndim == 1:
+        carrier_audio = carrier_audio[:, np.newaxis]
+    if stego_audio.ndim == 1:
+        stego_audio = stego_audio[:, np.newaxis]
+    if carrier_audio.shape != stego_audio.shape:
+        raise ValueError(
+            "Carrier and saved stego audio must have identical lengths and "
+            f"channels: {carrier_audio.shape} != {stego_audio.shape}"
+        )
+    if carrier_audio.shape[0] == 0 or sample_rate <= 0:
+        raise ValueError("Audio must be non-empty and sample rate must be positive.")
+    if not np.isfinite(carrier_audio).all() or not np.isfinite(stego_audio).all():
+        raise ValueError("Audio contains non-finite samples; quality is undefined.")
+
+    carrier_mono = carrier_audio[:, 0]
+    stego_mono = stego_audio[:, 0]
     waveform_ascii(stego_mono, label="STEGO AUDIO — After Embedding")
     info("Peak amplitude",      f"{np.max(np.abs(stego_mono)):.6f}")
 
-    diff   = stego_mono - carrier_mono
-    snr_db = (20 * np.log10(np.linalg.norm(carrier_mono) /
-              (np.linalg.norm(diff) + 1e-12)))
+    diff = stego_mono - carrier_mono
 
     print(f"\n  {MAGENTA}{BOLD}  ┌── DIFFERENCE (carrier − stego) ────────────────────────────────┐{RESET}")
     waveform_ascii(diff[:8000], label="PERTURBATION SIGNAL (magnified view — first 8000 samples)")
     print(f"  {MAGENTA}{BOLD}  └───────────────────────────────────────────────────────────────┘{RESET}")
 
     info("Max perturbation",  f"{np.max(np.abs(diff)):.8f}")
-    info("SNR",               f"{snr_db:.2f} dB  (higher = more transparent)")
+    error = carrier_audio - stego_audio
+    signal_power = float(np.mean(carrier_audio ** 2))
+    noise_power = float(np.mean(error ** 2))
+    if signal_power == 0:
+        snr_db = float("nan") if noise_power == 0 else float("-inf")
+    elif noise_power == 0:
+        snr_db = float("inf")
+    else:
+        snr_db = 10.0 * float(np.log10(signal_power / noise_power))
+    info("Channels measured", str(carrier_audio.shape[1]))
+    info("SNR (all channels)", f"{snr_db:.2f} dB  (higher = more transparent)")
     metrics = {
-        "mse": float(np.mean(diff ** 2)),
-        "rmse": float(np.sqrt(np.mean(diff ** 2))),
-        "mae": float(np.mean(np.abs(diff))),
+        "mse": noise_power,
+        "rmse": float(np.sqrt(noise_power)),
+        "mae": float(np.mean(np.abs(error))),
         "snr_db": float(snr_db),
-        "duration_seconds": len(carrier_mono) / sample_rate,
+        "duration_seconds": carrier_audio.shape[0] / sample_rate,
         "sample_rate": sample_rate,
     }
     info("MSE", f"{metrics['mse']:.10g}")
     info("RMSE", f"{metrics['rmse']:.10g}")
     info("MAE", f"{metrics['mae']:.10g}")
+    metrics.update(
+        calculate_perceptual_metrics(carrier_audio, stego_audio, sample_rate)
+    )
+    info(
+        "PESQ",
+        f"{metrics['pesq']:.6f}" if metrics["pesq"] is not None else "N/A (pesq package unavailable)",
+    )
+    info(
+        "STOI",
+        f"{metrics['stoi']:.6f}" if metrics["stoi"] is not None else "N/A (pystoi package unavailable)",
+    )
     ok("Post-embedding waveform displayed.")
     return metrics
 
@@ -827,7 +907,7 @@ def extract_encrypted_package(stego_mono: np.ndarray) -> bytes:
 def decrypt_biometric_payload(
     encrypted_package: bytes,
     key: bytes,
-) -> tuple[np.ndarray, bytes]:
+) -> tuple[np.ndarray, bytes, int]:
     nonce = encrypted_package[:12]
     plaintext = AESGCM(key).decrypt(nonce, encrypted_package[12:], None)
     if plaintext[:4] == b"CBQ1":
@@ -836,9 +916,9 @@ def decrypt_biometric_payload(
         quantized = np.frombuffer(plaintext[13:13 + template_length], dtype=np.int8)
         if quantized.size != template_length:
             raise ValueError("Decrypted biometric template has an invalid size.")
-        return quantized.astype(np.float32) * scale, b""
+        return quantized.astype(np.float32) * scale, b"", 1
 
-    if plaintext[:4] != b"CBQ2" or plaintext[4] != 1:
+    if plaintext[:4] not in (b"CBQ2", b"CBQ3") or plaintext[4] != 1:
         raise ValueError("Encrypted biometric template header is invalid.")
 
     template_length = struct.unpack(">I", plaintext[5:9])[0]
@@ -855,12 +935,19 @@ def decrypt_biometric_payload(
     face_image = plaintext[image_start:image_start + image_length]
     if len(face_image) != image_length:
         raise ValueError("Recovered face image data is incomplete.")
-    return quantized.astype(np.float32) * scale, face_image
+    template_version = 3 if plaintext[:4] == b"CBQ3" else 2
+    return quantized.astype(np.float32) * scale, face_image, template_version
 
 
-def decrypt_cancelable_template(encrypted_package: bytes, key: bytes) -> np.ndarray:
-    template, _ = decrypt_biometric_payload(encrypted_package, key)
-    return template
+def decrypt_cancelable_template(
+    encrypted_package: bytes,
+    key: bytes,
+) -> tuple[np.ndarray, int]:
+    template, _, template_version = decrypt_biometric_payload(
+        encrypted_package,
+        key,
+    )
+    return template, template_version
 
 
 def reject_duplicate_face(
@@ -892,12 +979,19 @@ def reject_duplicate_face(
             audio, _ = sf.read(io.BytesIO(audio_bytes), dtype="float64")
             audio_mono = audio if audio.ndim == 1 else audio[:, 0]
             encrypted_package = extract_encrypted_package(audio_mono)
-            registered_template = decrypt_cancelable_template(
+            registered_template, template_version = decrypt_cancelable_template(
                 encrypted_package,
                 key_file.read_bytes() if key_file.exists() else KEY_OUTPUT.read_bytes(),
             )
         except Exception as error:
             warn(f"Could not compare registered user {registered_user!r}: {error}")
+            skipped.append(registered_user)
+            continue
+        if template_version != 3:
+            warn(
+                f"Cannot compare registered user {registered_user!r}: "
+                "their template uses the old transform. Re-register this user."
+            )
             skipped.append(registered_user)
             continue
 
@@ -920,13 +1014,13 @@ def reject_duplicate_face(
 
     info("Registered faces checked", str(checked))
     if skipped:
-        raise RuntimeError(
-            "Duplicate check was incomplete. Could not validate stored users: "
+        warn(
+            "Duplicate check was incomplete. Registration will continue, but "
+            "a duplicate of these users could not be ruled out: "
             + ", ".join(skipped)
-            + ". Restore each user's local AES key or remove obsolete records "
-            "before registering another user."
         )
-    ok("No duplicate was found among decryptable registered faces.")
+        return
+    ok("No duplicate was found among registered faces.")
 
 
 # =============================================================================
@@ -969,7 +1063,16 @@ def verify_roundtrip(
 
     if magic_r != b"CFD1":
         warn("Magic mismatch — embedding may be corrupted.")
-        return {"aes_status": False, "sender_match": False, "authenticated": False}
+        return {
+            "aes_status": False,
+            "sender_match": False,
+            "authenticated": False,
+            "cosine_similarity": None,
+            "ber": None,
+            "bit_errors": None,
+            "total_bits": len(sender_payload) * 8,
+            "threshold": AUTHENTICATION_THRESHOLD,
+        }
 
     # Extract payload bits
     total_bits   = (41 + plen_r) * 8
@@ -990,28 +1093,62 @@ def verify_roundtrip(
     info("Recovered encrypted bytes", len(recovered_encrypted))
     sender_match = recovered_encrypted == sender_payload
     info("Sender payload matches receiver", "YES" if sender_match else "NO")
+    total_bits = len(sender_payload) * 8
+    bit_errors = None
+    ber = None
+    if len(recovered_encrypted) == len(sender_payload):
+        bit_errors = sum(
+            (expected ^ recovered).bit_count()
+            for expected, recovered in zip(sender_payload, recovered_encrypted)
+        )
+        ber = bit_errors / total_bits if total_bits else 0.0
+        info(
+            "Stego payload BER (not face accuracy)",
+            f"{ber:.8%} ({bit_errors}/{total_bits} bits)",
+        )
+    else:
+        warn(
+            "BER is unavailable because the recovered payload length "
+            f"({len(recovered_encrypted)}) differs from the sent length "
+            f"({len(sender_payload)})."
+        )
 
     expected_digest = frame_header_bytes[9:41]
     actual_digest = hashlib.sha256(recovered_encrypted).digest()
     if actual_digest != expected_digest:
         warn("Payload checksum mismatch — recovered audio data is corrupted.")
-        return {"aes_status": False, "sender_match": sender_match, "authenticated": False}
+        return {
+            "aes_status": False,
+            "sender_match": sender_match,
+            "authenticated": False,
+            "cosine_similarity": None,
+            "ber": ber,
+            "bit_errors": bit_errors,
+            "total_bits": total_bits,
+            "threshold": AUTHENTICATION_THRESHOLD,
+        }
     ok("Payload SHA-256 checksum verified.")
 
     # Decrypt
     try:
-        recovered_emb, _ = decrypt_biometric_payload(recovered_encrypted, key)
+        recovered_emb, _, _ = decrypt_biometric_payload(recovered_encrypted, key)
         ok("AES-256-GCM decryption successful — GCM tag verified ✔")
     except Exception as e:
         warn(f"Decryption failed: {e}")
-        return {"aes_status": False, "sender_match": sender_match, "authenticated": False}
+        return {
+            "aes_status": False,
+            "sender_match": sender_match,
+            "authenticated": False,
+            "cosine_similarity": None,
+            "ber": ber,
+            "bit_errors": bit_errors,
+            "total_bits": total_bits,
+            "threshold": AUTHENTICATION_THRESHOLD,
+        }
 
-    cosine_sim = float(
-        np.dot(expected_template, recovered_emb) /
-        (np.linalg.norm(expected_template) * np.linalg.norm(recovered_emb) + 1e-12)
-    )
+    cosine_sim = cosine_similarity(expected_template, recovered_emb)
 
-    threshold = 0.90
+    threshold = AUTHENTICATION_THRESHOLD
     authenticated = cosine_sim >= threshold
     info("Cancelable template cosine similarity", f"{cosine_sim:.6f}")
     info("Authentication threshold", f"{threshold:.2f}")
@@ -1025,6 +1162,140 @@ def verify_roundtrip(
         "sender_match": sender_match,
         "authenticated": authenticated,
         "cosine_similarity": cosine_sim,
+        "ber": ber,
+        "bit_errors": bit_errors,
+        "total_bits": total_bits,
+        "threshold": threshold,
+    }
+
+
+def calculate_far_frr(
+    receiver_embeddings: list[np.ndarray],
+    user_id: str,
+    storage: PipelineStorage,
+    verification: dict,
+) -> dict:
+    """Measure session-level rates, accounting for every receiver capture attempt."""
+    threshold = float(verification.get("threshold", 0.90))
+    genuine_score = verification.get("cosine_similarity")
+    genuine_trials = int(genuine_score is not None)
+    false_rejects = 0
+    if genuine_score is not None:
+        false_rejects = int(float(genuine_score) < threshold)
+    impostor_scores = []
+    incompatible_users = []
+    invalid_audio_users = []
+
+    for registered_user in storage.list_user_ids():
+        if registered_user == user_id:
+            continue
+
+        key_path = key_path_for_user(registered_user)
+        if not key_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot calculate FAR: AES key is missing for stored user "
+                f"{registered_user!r} ({key_path})."
+            )
+        audio_bytes = storage.get_stego_audio(registered_user)
+        if audio_bytes is None:
+            raise RuntimeError(
+                f"Cannot calculate FAR: stored audio is missing for user "
+                f"{registered_user!r}."
+            )
+
+        stored_audio, _ = sf.read(io.BytesIO(audio_bytes), dtype="float64")
+        stored_mono = (
+            stored_audio if stored_audio.ndim == 1 else stored_audio[:, 0]
+        )
+        try:
+            stored_payload = extract_encrypted_package(stored_mono)
+        except ValueError as error:
+            invalid_audio_users.append((registered_user, str(error)))
+            continue
+        stored_template, template_version = decrypt_cancelable_template(
+            stored_payload,
+            key_path.read_bytes(),
+        )
+        if template_version != 3:
+            incompatible_users.append(registered_user)
+            continue
+        attempt_scores = [
+            cosine_similarity(
+                CancelableBiometrics(receiver_embedding.size).transform(
+                    receiver_embedding,
+                    registered_user,
+                ),
+                stored_template,
+            )
+            for receiver_embedding in receiver_embeddings
+        ]
+        if attempt_scores:
+            impostor_scores.append(max(attempt_scores))
+
+    if incompatible_users:
+        warn(
+            "FAR excludes users with old biometric transforms; re-register: "
+            + ", ".join(incompatible_users)
+        )
+    if invalid_audio_users:
+        warn(
+            "FAR excludes stored audio without a valid embedded payload: "
+            + "; ".join(
+                f"{registered_user!r} ({reason})"
+                for registered_user, reason in invalid_audio_users
+            )
+            + ". Re-register these users with the current pipeline."
+        )
+
+    false_accepts = sum(score >= threshold for score in impostor_scores)
+    frr = (
+        100.0 * false_rejects / genuine_trials
+        if genuine_trials
+        else None
+    )
+    far = (
+        100.0 * false_accepts / len(impostor_scores)
+        if impostor_scores
+        else None
+    )
+    info(
+        "False rejection rate (FRR)",
+        (
+            f"{frr:.2f}% ({false_rejects}/{genuine_trials} genuine trial)"
+            if frr is not None
+            else "N/A (no completed genuine comparison)"
+        ),
+    )
+    info(
+        "False acceptance rate (FAR)",
+        (
+            f"{far:.2f}% ({false_accepts}/{len(impostor_scores)} impostor trials)"
+            if far is not None
+            else "N/A (no eligible impostor trials; register other users)"
+        ),
+    )
+    balanced_accuracy = (
+        100.0 - (frr + far) / 2.0
+        if frr is not None and far is not None
+        else None
+    )
+    info(
+        "Balanced verification accuracy",
+        (
+            f"{balanced_accuracy:.2f}% "
+            f"({genuine_trials} genuine, {len(impostor_scores)} impostor trials)"
+            if balanced_accuracy is not None
+            else "N/A (requires both genuine and impostor trials)"
+        ),
+    )
+    return {
+        "far": far,
+        "frr": frr,
+        "balanced_accuracy": balanced_accuracy,
+        "false_accepts": false_accepts,
+        "impostor_trials": len(impostor_scores),
+        "false_rejects": false_rejects,
+        "genuine_trials": genuine_trials,
     }
 
 
@@ -1039,6 +1310,8 @@ def print_summary(
     verification: dict,
     user_key_path: Path,
     database_saved: bool,
+    receiver_image_path: Path,
+    receiver_artifact_prefix: str,
 ):
     banner("PIPELINE SUMMARY", GREEN)
     print()
@@ -1046,8 +1319,11 @@ def print_summary(
         ("Input image",          str(image_path)),
         ("Sender detected face", str(OUTPUT_DIR / "sender_face_detected.jpg")),
         ("Sender face crop", str(OUTPUT_DIR / "sender_face_cropped_160x160.jpg")),
-        ("Receiver face", str(OUTPUT_DIR / "receiver_face.jpg")),
-        ("Receiver detected face", str(OUTPUT_DIR / "receiver_face_detected.jpg")),
+        ("Receiver face", str(receiver_image_path)),
+        (
+            "Receiver detected face",
+            str(OUTPUT_DIR / f"{receiver_artifact_prefix}_face_detected.jpg"),
+        ),
         ("Recovered embedded face image", str(OUTPUT_DIR / "recovered_face.jpg")),
         ("Carrier WAV", str(carrier_path)),
         ("Carrier duration / sample rate", "{:.2f} s / {} Hz".format(
@@ -1060,12 +1336,29 @@ def print_summary(
         ("AES-GCM status", "PASS" if verification.get("aes_status") else "FAIL"),
         ("Sender payload match", "YES" if verification.get("sender_match") else "NO"),
         ("Receiver authentication", "PASS" if verification.get("authenticated") else "FAIL"),
+        ("Receiver capture attempts", str(verification.get("authentication_attempts", 1))),
+        ("Stego payload BER (not face accuracy)", f"{verification.get('ber'):.8%}" if verification.get('ber') is not None else "N/A"),
+        ("False acceptance rate (FAR)", f"{verification.get('far'):.2f}%" if verification.get("far") is not None else "N/A"),
+        (
+            "False rejection rate (FRR)",
+            f"{verification['frr']:.2f}%"
+            if verification.get("frr") is not None
+            else "N/A",
+        ),
+        (
+            "Balanced verification accuracy",
+            f"{verification['balanced_accuracy']:.2f}%"
+            if verification.get("balanced_accuracy") is not None
+            else "N/A (requires genuine and impostor trials)",
+        ),
         ("Database status", "SAVED" if database_saved else "NOT SAVED"),
         ("Cosine similarity", f"{verification.get('cosine_similarity', 0.0):.6f}"),
-        ("Audio MSE / RMSE / MAE", "{:.6g} / {:.6g} / {:.6g}".format(
+        ("Audio MSE / RMSE / MAE (all channels)", "{:.6g} / {:.6g} / {:.6g}".format(
             metrics["mse"], metrics["rmse"], metrics["mae"]
         )),
-        ("Audio SNR", f"{metrics['snr_db']:.2f} dB"),
+        ("Audio SNR (all channels)", f"{metrics['snr_db']:.2f} dB"),
+        ("Audio PESQ", f"{metrics['pesq']:.6f}" if metrics["pesq"] is not None else "N/A"),
+        ("Audio STOI", f"{metrics['stoi']:.6f}" if metrics["stoi"] is not None else "N/A"),
     ]
     for label, value in rows:
         info(label, value)
@@ -1105,7 +1398,7 @@ def main():
         "--username",
         dest="user_id",
         default=None,
-        help="Username key for the cancelable template and MySQL audio record; prompted if omitted."
+        help="Username key for the cancelable template and audio record; prompted if omitted."
     )
     parser.add_argument(
         "--auth-image",
@@ -1130,12 +1423,13 @@ def main():
     print(f"  {DIM}AES-256-GCM Encryption  +  Audio Steganography{RESET}")
     print(f"  {DIM}{'─' * 60}{RESET}")
 
-    user_id = args.user_id
-    while not user_id:
-        user_id = input("Enter username for this face/audio record: ").strip()
-    if len(user_id) > 191:
+    username = args.user_id
+    while not username:
+        username = input("Enter username for this face/audio record: ").strip()
+    user_id = username
+    if len(username) > 191:
         parser.error("Username must be 191 characters or fewer.")
-    info("User record", user_id)
+    info("User record", username)
 
     # ── Resolve image path ────────────────────────────────────────────────────
     if args.image:
@@ -1173,35 +1467,98 @@ def main():
         carrier_audio, sr, encrypted_pkg, carrier_mono
     )
     play_audio_file(STEGO_OUTPUT, "Stego audio after embedding")
-    received_audio, _ = sf.read(str(STEGO_OUTPUT), dtype="float64")
-    received_mono = received_audio if received_audio.ndim == 1 else received_audio[:, 0]
-    metrics = display_waveform_after(carrier_mono, received_mono, sr)      # Step 9
-    storage.save_stego_audio(user_id, STEGO_OUTPUT)
+    received_audio, received_rate = sf.read(str(STEGO_OUTPUT), dtype="float64")
+    if received_rate != sr:
+        raise ValueError(
+            f"Saved stego sample rate changed: expected {sr}, got {received_rate}."
+        )
+    metrics = display_waveform_after(carrier_audio, received_audio, sr)    # Step 9
+    storage.save_stego_audio(user_id, STEGO_OUTPUT, username=username)
     database_receiver_audio = storage.retrieve_stego_audio(
         user_id,
         OUTPUT_DIR / "receiver_stego_audio.wav",
     )
-    info("MySQL database", f"{storage.database} on {storage.host}:{storage.port}")
-    info("Database receiver audio", str(database_receiver_audio))
+    info("Audio storage", storage.description)
+    ok("Receiver fetched the stego audio from storage.")
+    info("Receiver audio", str(database_receiver_audio))
     received_audio, received_rate = sf.read(str(database_receiver_audio), dtype="float64")
     if received_rate != sr:
         raise ValueError("Stored receiver audio sample rate does not match the carrier.")
     received_mono = received_audio if received_audio.ndim == 1 else received_audio[:, 0]
 
-    if args.auth_image is not None:
-        receiver_image_path = args.auth_image
-    else:
-        receiver_image_path = capture_face_from_camera(
-            args.camera_index,
-            OUTPUT_DIR / "receiver_face.jpg",
-            "Capture Receiver Authentication Face",
+    sender_template_for_matching, _ = decrypt_cancelable_template(
+        encrypted_pkg,
+        key,
+    )
+    receiver_attempts = []
+    max_attempts = 1 if args.auth_image is not None else MAX_AUTH_CAPTURE_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
+        if args.auth_image is not None:
+            receiver_image_path = args.auth_image
+        else:
+            capture_path = (
+                OUTPUT_DIR / "receiver_face.jpg"
+                if attempt == 1
+                else OUTPUT_DIR / f"receiver_face_attempt_{attempt}.jpg"
+            )
+            receiver_image_path = capture_face_from_camera(
+                args.camera_index,
+                capture_path,
+                f"Capture Receiver Authentication Face ({attempt}/{max_attempts})",
+            )
+
+        load_face_image(receiver_image_path)
+        receiver_embedding = extract_features(
+            receiver_image_path,
+            device,
+            f"receiver_attempt_{attempt}",
         )
-    load_face_image(receiver_image_path)
-    receiver_embedding = extract_features(receiver_image_path, device, "receiver")
-    receiver_template = make_cancelable_template(
+        receiver_template = make_cancelable_template(
+            receiver_embedding,
+            user_id,
+            f"Receiver Query Cancelable Template ({attempt}/{max_attempts})",
+        )
+        similarity = cosine_similarity(
+            sender_template_for_matching,
+            receiver_template,
+        )
+        receiver_artifact_prefix = f"receiver_attempt_{attempt}"
+        receiver_attempts.append(
+            (
+                similarity,
+                receiver_embedding,
+                receiver_template,
+                receiver_image_path,
+                receiver_artifact_prefix,
+            )
+        )
+        info(
+            "Receiver match score",
+            f"{similarity:.6f} ({attempt}/{max_attempts})",
+        )
+
+        if similarity >= AUTHENTICATION_THRESHOLD:
+            ok(f"Receiver face accepted on capture {attempt}.")
+            break
+        if attempt < max_attempts:
+            warn(
+                "This capture did not meet the 0.90 threshold. "
+                "Try again facing the camera with even lighting."
+            )
+
+    (
+        _,
         receiver_embedding,
-        user_id,
-        "Receiver Query Cancelable Template",
+        receiver_template,
+        receiver_image_path,
+        receiver_artifact_prefix,
+    ) = max(
+        receiver_attempts,
+        key=lambda candidate: candidate[0],
+    )
+    info(
+        "Authentication capture attempts",
+        f"{len(receiver_attempts)}/{max_attempts}",
     )
 
     verification = verify_roundtrip(                                     # Step 10
@@ -1210,19 +1567,48 @@ def main():
         receiver_template,
         encrypted_pkg,
     )
-    recovered_package = extract_encrypted_package(received_mono)
-    _, recovered_face_image = decrypt_biometric_payload(recovered_package, key)
-    if recovered_face_image:
-        recovered_image_path = OUTPUT_DIR / "recovered_face.jpg"
-        recovered_image_path.write_bytes(recovered_face_image)
-        info("Recovered embedded image", str(recovered_image_path))
-        show_image_in_console(
-            recovered_image_path,
-            label="FACE IMAGE RECOVERED FROM STEGO AUDIO",
+    verification["authentication_attempts"] = len(receiver_attempts)
+    verification.update(
+        calculate_far_frr(
+            [attempt[1] for attempt in receiver_attempts],
+            user_id,
+            storage,
+            verification,
         )
+    )
+    step(11, "Recovering Embedded Face Image from Stego Audio")
+    info("Recovery source", str(database_receiver_audio))
+    ok("Extracting encrypted image payload from stego audio...")
+    recovered_package = extract_encrypted_package(received_mono)
+    ok(f"Payload extracted and checksum verified ({len(recovered_package)} bytes).")
+    ok("Decrypting payload and reconstructing embedded image...")
+    _, recovered_face_image, _ = decrypt_biometric_payload(
+        recovered_package,
+        key,
+    )
+    if recovered_face_image:
+        with Image.open(io.BytesIO(recovered_face_image)) as recovered_image:
+            recovered_image.load()
+            recovered_image_path = OUTPUT_DIR / "recovered_face.jpg"
+            recovered_image_path.write_bytes(recovered_face_image)
+            ok(f"Recovered image decoded ({recovered_image.width} × {recovered_image.height} px).")
+            show_image(
+                recovered_image.copy(),
+                label="COVER IMAGE RECOVERED FROM STEGO AUDIO",
+            )
+        info("Recovered embedded image", str(recovered_image_path))
     else:
         warn("This stego payload contains no recoverable image.")
-    print_summary(image_path, carrier_path, metrics, verification, user_key_path, True)
+    print_summary(
+        image_path,
+        carrier_path,
+        metrics,
+        verification,
+        user_key_path,
+        True,
+        receiver_image_path,
+        receiver_artifact_prefix,
+    )
 
 
 if __name__ == "__main__":

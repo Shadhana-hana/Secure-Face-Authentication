@@ -24,22 +24,13 @@ class CancelableBiometrics:
         matrix = rng.normal(
             0,
             1,
-            (
-                self.dimension,
-                self.dimension
-            )
+            (self.dimension, self.dimension),
         )
+        projection, triangular = np.linalg.qr(matrix)
+        signs = np.sign(np.diag(triangular))
+        signs[signs == 0] = 1
 
-        # Normalize columns
-        matrix = matrix / (
-            np.linalg.norm(
-                matrix,
-                axis=0,
-                keepdims=True
-            ) + 1e-8
-        )
-
-        return matrix.astype(np.float32)
+        return (projection * signs).astype(np.float32)
 
     def transform(
         self,
